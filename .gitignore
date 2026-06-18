@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kaggle credentials
+kaggle.json
+.kaggle/
+
+# Raw M5 data
+calendar.csv
+sales_train_validation.csv
+sales_train_evaluation.csv
+sell_prices.csv
+sample_submission.csv
+
+# Cache
+.cache/
+kagglehub/
+
+# Models
+*.pkl
+*.joblib
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Executed notebooks
+notebooks/executed_*.ipynb
