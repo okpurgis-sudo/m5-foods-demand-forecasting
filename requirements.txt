@@ -7,3 +7,6 @@ kagglehub
 joblib
 jupyter
 nbconvert
+flask
+gunicorn
+boto3
