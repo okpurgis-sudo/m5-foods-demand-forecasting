@@ -2,7 +2,7 @@
 
 Kaggle の **M5 Forecasting Accuracy** データセットを用いて、FOODS カテゴリ商品の需要予測を行う機械学習プロジェクトです。
 
-単に Notebook 上で分析するだけではなく、Linux 上で再現可能なパイプライン化、学習済みモデルの保存、AWS S3 への成果物保存、EC2 上での Flask API / HTML デモ画面による予測まで実装しました。
+Notebook 上で分析するだけではなく、Linux 上で再現可能なパイプライン化、学習済みモデルの保存、AWS S3 への成果物保存、EC2 上での Flask API / HTML デモ画面による予測も実装しました。
 
 ## プロジェクト概要
 
