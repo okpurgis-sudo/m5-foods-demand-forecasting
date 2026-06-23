@@ -348,7 +348,7 @@ JSON と HTML 画面に結果を返す
 
 Prediction Demo
 
-!["デモ画面"]("images/demo_top.png")
+!["デモ画面"]('images/demo_top.png')
 
 食品需要予測のHTMLデモ画面です。
 商品タイプ、過去の販売数、直近の売れ行き、価格、週末・イベント・SNAP条件を入力し、予測販売数を確認できます。
