@@ -358,7 +358,7 @@ Prediction Demo
 
 Prediction Result
 
-!["結果表示"]("images/demo_prediction_result.png")
+!["結果表示"](images/demo_prediction_result.png)
 
 入力値をもとに、Flask APIが学習済みXGBoostモデルを呼び出し、予測販売数を返します。
 画面上では「約〇個」のように表示し、技術者向けにはJSONレスポンスも確認できるようにしています。
