@@ -92,6 +92,8 @@ m5-foods-demand-forecasting/
 ```
 Prediction Demo
 
+("images/demo_top.png")
+
 食品需要予測のHTMLデモ画面です。
 商品タイプ、過去の販売数、直近の売れ行き、価格、週末・イベント・SNAP条件を入力し、予測販売数を確認できます。
 
@@ -99,6 +101,8 @@ Prediction Demo
 
 
 Prediction Result
+
+("images/demo_prediction_result.png")
 
 入力値をもとに、Flask APIが学習済みXGBoostモデルを呼び出し、予測販売数を返します。
 画面上では「約〇個」のように表示し、技術者向けにはJSONレスポンスも確認できるようにしています。
