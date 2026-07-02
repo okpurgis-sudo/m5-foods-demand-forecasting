@@ -363,7 +363,7 @@ Prediction Result
 入力値をもとに、Flask APIが学習済みXGBoostモデルを呼び出し、予測販売数を返します。
 画面上では「約〇個」のように表示し、技術者向けにはJSONレスポンスも確認できるようにしています。
 
-!["結果表示"](images/demo_prediction_result.png)
+!["結果表示"](images/api_health.png)
 
 現在の HTML デモでは、ユーザーに分かりやすいように、機械学習上の特徴量名を日本語に置き換えています。
 
