@@ -1,4 +1,4 @@
-# M5 FOODS Demand Forecasting
+# M5 Forecasting Accuracy 分析
 
 Kaggle の **M5 Forecasting Accuracy** データセットを用いて、FOODS カテゴリ商品の需要予測を行う機械学習プロジェクトです。
 
