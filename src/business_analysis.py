@@ -135,7 +135,7 @@ def create_group_summary(food_sales: pd.DataFrame, day_cols: list[str]) -> pd.Da
                 "累計販売数": float(values.sum()),
                 "1日あたり平均販売数": float(values.mean()),
                 "1日あたり中央値": float(np.median(values)),
-                "0販売率": float((values == 0).mean()),
+                "販売数が0だった日の割合": float((values == 0).mean()),
                 "最大日次販売数": float(values.max()),
             }
         )
@@ -192,10 +192,10 @@ def plot_zero_rate_by_group(summary: pd.DataFrame):
     plot_df = summary.copy()
 
     plt.figure(figsize=(9, 5))
-    plt.bar(plot_df["販売グループ"], plot_df["0販売率"])
-    plt.title("販売規模別の0販売率")
-    plt.xlabel("販売グループ")
-    plt.ylabel("0販売率")
+    plt.bar(plot_df["販売グループ"], plot_df["販売数が0だった日の割合"])
+    plt.title("商品グループ別：販売数が0だった日の割合")
+    plt.xlabel("商品グループ")
+    plt.ylabel("販売数が0だった日の割合")
     plt.ylim(0, 1)
     plt.xticks(rotation=15)
     plt.tight_layout()
