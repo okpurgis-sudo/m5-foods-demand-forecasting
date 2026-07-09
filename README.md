@@ -307,7 +307,7 @@ test : 2016-04-01 以降
 イベント日と通常日の平均販売数を比較しました。  
 イベント情報は食品需要に影響する可能性があるため、需要予測モデルの特徴量として使用しました。
 
-![Event Impact](images/business_event_impact.png)
+![イベント日の販売数比較](images/business_event_impact.png)
 
 ### SNAP Impact
 
