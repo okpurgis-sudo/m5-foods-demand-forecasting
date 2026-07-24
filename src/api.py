@@ -1,798 +1,1023 @@
-from pathlib import Path
-import os
+"""保存済みXGBoostモデルを呼び出すポートフォリオ用Flask API。"""
 
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+from flask import Flask, jsonify, render_template_string, request
 import joblib
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, request, render_template_string
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MODELS_DIR = PROJECT_ROOT / "models"
+GROUPS = ("top", "middle", "bottom")
 
 app = Flask(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MODEL_DIR = Path(os.environ.get("MODEL_DIR", PROJECT_ROOT / "models"))
-
-MODEL_FILES = {
-    "top": "xgboost_log1p_top.joblib",
-    "middle": "xgboost_log1p_middle.joblib",
-    "bottom": "xgboost_log1p_bottom.joblib",
+GROUP_META = {
+    "top": {
+        "label": "よく売れる商品",
+        "description": "販売量が多く、比較的安定した需要を持つ商品群",
+        "badge": "高需要",
+    },
+    "middle": {
+        "label": "平均的な商品",
+        "description": "販売量が中程度の商品群",
+        "badge": "中需要",
+    },
+    "bottom": {
+        "label": "あまり売れない商品",
+        "description": "販売数0の日も多く、需要変動が大きい商品群",
+        "badge": "低需要",
+    },
 }
 
-models = {}
+FEATURE_FIELDS = [
+    {
+        "name": "lag_7",
+        "label": "1週間前の販売数",
+        "description": "7日前に販売された個数",
+        "section": "過去の販売数",
+        "step": "1",
+        "min": "0",
+        "default": "10",
+    },
+    {
+        "name": "lag_14",
+        "label": "2週間前の販売数",
+        "description": "14日前に販売された個数",
+        "section": "過去の販売数",
+        "step": "1",
+        "min": "0",
+        "default": "9",
+    },
+    {
+        "name": "lag_28",
+        "label": "4週間前の販売数",
+        "description": "28日前に販売された個数",
+        "section": "過去の販売数",
+        "step": "1",
+        "min": "0",
+        "default": "8",
+    },
+    {
+        "name": "rolling_mean_7",
+        "label": "直近1週間の平均販売数",
+        "description": "直近7日間の販売数の平均",
+        "section": "最近の販売傾向",
+        "step": "0.01",
+        "min": "0",
+        "default": "9.5",
+    },
+    {
+        "name": "rolling_mean_28",
+        "label": "直近4週間の平均販売数",
+        "description": "直近28日間の販売数の平均",
+        "section": "最近の販売傾向",
+        "step": "0.01",
+        "min": "0",
+        "default": "8.8",
+    },
+    {
+        "name": "sell_price",
+        "label": "販売価格",
+        "description": "M5データ上の商品価格（例：3.50）",
+        "section": "価格・カレンダー条件",
+        "step": "0.01",
+        "min": "0",
+        "default": "3.5",
+    },
+    {
+        "name": "price_change_1",
+        "label": "直近の価格変化率",
+        "description": "前週からの価格変化率。変化なしは0",
+        "section": "価格・カレンダー条件",
+        "step": "0.01",
+        "default": "0",
+    },
+    {
+        "name": "has_event",
+        "label": "祝日・イベント日",
+        "description": "予測対象日にイベントがある場合はオン",
+        "section": "価格・カレンダー条件",
+        "type": "checkbox",
+        "default": "0",
+    },
+    {
+        "name": "is_snap_day",
+        "label": "SNAP対象日",
+        "description": "米国の食品購買支援制度の対象日はオン",
+        "section": "価格・カレンダー条件",
+        "type": "checkbox",
+        "default": "0",
+    },
+]
 
+SECTION_DESCRIPTIONS = {
+    "過去の販売数": "同じ商品の周期的な売れ方をモデルへ伝える入力です。",
+    "最近の販売傾向": "一時的なばらつきを抑え、直近の需要水準を表します。",
+    "価格・カレンダー条件": "価格変更やイベントなど、需要を動かす外部条件です。",
+}
 
-HTML_PAGE = """
-<!DOCTYPE html>
+EXAMPLE_PRESETS = {
+    "top": {
+        "lag_7": 18,
+        "lag_14": 16,
+        "lag_28": 17,
+        "rolling_mean_7": 17.5,
+        "rolling_mean_28": 16.8,
+        "sell_price": 3.5,
+        "price_change_1": 0,
+        "has_event": 0,
+        "is_snap_day": 1,
+    },
+    "middle": {
+        "lag_7": 2,
+        "lag_14": 1,
+        "lag_28": 2,
+        "rolling_mean_7": 1.7,
+        "rolling_mean_28": 1.5,
+        "sell_price": 4.2,
+        "price_change_1": 0,
+        "has_event": 1,
+        "is_snap_day": 0,
+    },
+    "bottom": {
+        "lag_7": 0,
+        "lag_14": 1,
+        "lag_28": 0,
+        "rolling_mean_7": 0.3,
+        "rolling_mean_28": 0.4,
+        "sell_price": 2.8,
+        "price_change_1": -0.05,
+        "has_event": 0,
+        "is_snap_day": 0,
+    },
+}
+
+DEFAULT_FORM = {
+    "sales_group": "top",
+    **{field["name"]: field.get("default", "0") for field in FEATURE_FIELDS},
+}
+
+HTML = """
+<!doctype html>
 <html lang="ja">
 <head>
-    <meta charset="UTF-8">
-    <title>食品需要予測デモ</title>
-    <style>
-        body {
-            font-family: Arial, "Hiragino Sans", "Yu Gothic", sans-serif;
-            background: #f4f7fb;
-            margin: 0;
-            color: #1f2937;
-        }
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Kaggle M5データで学習したXGBoostモデルによる食品需要予測デモ">
+  <title>M5 食品需要予測デモ</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f6f8;
+      --surface: #ffffff;
+      --surface-soft: #f8fafb;
+      --text: #17212b;
+      --muted: #637180;
+      --border: #dce3e8;
+      --primary: #176b5b;
+      --primary-dark: #0f5145;
+      --primary-soft: #e5f3ef;
+      --accent: #d98b2b;
+      --danger: #a83a3a;
+      --danger-soft: #fff0f0;
+      --shadow: 0 16px 42px rgba(31, 48, 61, 0.10);
+      --radius-lg: 22px;
+      --radius-md: 14px;
+    }
 
-        .hero {
-            background: linear-gradient(135deg, #155eef, #6d28d9);
-            color: white;
-            padding: 38px 24px;
-        }
+    * { box-sizing: border-box; }
 
-        .hero-inner {
-            max-width: 1050px;
-            margin: auto;
-        }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 12% 4%, rgba(23, 107, 91, 0.10), transparent 30rem),
+        radial-gradient(circle at 90% 10%, rgba(217, 139, 43, 0.10), transparent 28rem),
+        var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans JP", sans-serif;
+      line-height: 1.65;
+    }
 
-        .hero h1 {
-            margin: 0 0 12px 0;
-            font-size: 32px;
-        }
+    button, input { font: inherit; }
 
-        .hero p {
-            margin: 0;
-            line-height: 1.8;
-            font-size: 15px;
-            opacity: 0.96;
-        }
+    a { color: var(--primary); }
 
-        .container {
-            max-width: 1050px;
-            margin: 28px auto;
-            padding: 0 20px 48px 20px;
-        }
+    .page-shell {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 36px 0 56px;
+    }
 
-        .card {
-            background: white;
-            border-radius: 14px;
-            padding: 24px;
-            margin-bottom: 20px;
-            box-shadow: 0 8px 26px rgba(15, 23, 42, 0.08);
-        }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: clamp(28px, 5vw, 54px);
+      border-radius: 28px;
+      background: linear-gradient(135deg, #123d36 0%, #176b5b 58%, #24816f 100%);
+      color: #fff;
+      box-shadow: var(--shadow);
+    }
 
-        h2 {
-            margin-top: 0;
-            font-size: 22px;
-        }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 300px;
+      height: 300px;
+      right: -100px;
+      top: -150px;
+      border: 1px solid rgba(255, 255, 255, .18);
+      border-radius: 50%;
+      box-shadow: 0 0 0 54px rgba(255, 255, 255, .05), 0 0 0 108px rgba(255, 255, 255, .03);
+    }
 
-        h3 {
-            margin-top: 0;
-            font-size: 17px;
-            color: #334155;
-        }
+    .hero-content { position: relative; z-index: 1; max-width: 790px; }
 
-        .lead {
-            line-height: 1.8;
-            color: #475569;
-        }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 14px;
+      padding: 6px 11px;
+      border: 1px solid rgba(255,255,255,.24);
+      border-radius: 999px;
+      background: rgba(255,255,255,.10);
+      font-size: .84rem;
+      font-weight: 700;
+      letter-spacing: .04em;
+    }
 
-        .step-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 14px;
-        }
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 5vw, 3.7rem);
+      line-height: 1.16;
+      letter-spacing: -.035em;
+    }
 
-        .step-card {
-            background: #f8fafc;
-            border: 1px solid #e2e8f0;
-            border-radius: 12px;
-            padding: 16px;
-            line-height: 1.7;
-        }
+    .hero p {
+      margin: 18px 0 0;
+      color: rgba(255,255,255,.86);
+      font-size: clamp(.98rem, 2vw, 1.12rem);
+    }
 
-        .step-card strong {
-            color: #155eef;
-        }
+    .hero-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 24px;
+    }
 
-        .form-section {
-            margin-top: 24px;
-            padding-top: 20px;
-            border-top: 1px solid #e5e7eb;
-        }
+    .hero-tag {
+      padding: 6px 10px;
+      border-radius: 8px;
+      background: rgba(0,0,0,.16);
+      font-size: .84rem;
+      font-weight: 650;
+    }
 
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 16px;
-        }
+    .status-line {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin-top: 18px;
+      color: rgba(255,255,255,.78);
+      font-size: .88rem;
+    }
 
-        label {
-            font-weight: bold;
-            font-size: 14px;
-            display: block;
-            margin-bottom: 6px;
-        }
+    .status-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #ffd36b;
+      box-shadow: 0 0 0 4px rgba(255,211,107,.15);
+    }
 
-        .tech-name {
-            font-size: 11px;
-            color: #64748b;
-            font-weight: normal;
-            margin-left: 4px;
-        }
+    .status-dot.online { background: #72e0a9; box-shadow: 0 0 0 4px rgba(114,224,169,.16); }
+    .status-dot.offline { background: #ff9292; box-shadow: 0 0 0 4px rgba(255,146,146,.16); }
 
-        .hint {
-            font-size: 12px;
-            color: #64748b;
-            line-height: 1.5;
-            margin-top: 5px;
-        }
+    .process-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin: 22px 0;
+    }
 
-        input, select {
-            width: 100%;
-            box-sizing: border-box;
-            padding: 10px;
-            border: 1px solid #cbd5e1;
-            border-radius: 8px;
-            font-size: 14px;
-            background: white;
-        }
+    .process-card {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      padding: 18px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: rgba(255,255,255,.76);
+    }
 
-        .checkbox-area {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 14px;
-            margin-top: 14px;
-        }
+    .process-number {
+      display: grid;
+      flex: 0 0 34px;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border-radius: 10px;
+      background: var(--primary-soft);
+      color: var(--primary);
+      font-weight: 800;
+    }
 
-        .check-card {
-            background: #f8fafc;
-            border: 1px solid #e2e8f0;
-            border-radius: 10px;
-            padding: 12px;
-            line-height: 1.6;
-        }
+    .process-card strong { display: block; margin-bottom: 2px; }
+    .process-card span { color: var(--muted); font-size: .9rem; }
 
-        .check-card label {
-            font-weight: bold;
-            margin: 0 0 4px 0;
-        }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 340px;
+      gap: 22px;
+      align-items: start;
+    }
 
-        .check-card input {
-            width: auto;
-            margin-right: 6px;
-        }
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      box-shadow: 0 10px 30px rgba(31,48,61,.06);
+    }
 
-        .button-row {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-            margin-top: 24px;
-        }
+    .panel-header {
+      padding: 24px 26px 18px;
+      border-bottom: 1px solid var(--border);
+    }
 
-        button {
-            background: #155eef;
-            color: white;
-            border: none;
-            padding: 13px 22px;
-            border-radius: 9px;
-            font-size: 15px;
-            cursor: pointer;
-            font-weight: bold;
-        }
+    .panel-header h2 { margin: 0; font-size: 1.35rem; }
+    .panel-header p { margin: 5px 0 0; color: var(--muted); font-size: .92rem; }
 
-        button.secondary {
-            background: #475569;
-        }
+    .panel-body { padding: 26px; }
 
-        button:hover {
-            opacity: 0.92;
-        }
+    .form-section + .form-section {
+      margin-top: 30px;
+      padding-top: 28px;
+      border-top: 1px solid var(--border);
+    }
 
-        .result-main {
-            margin-top: 22px;
-            padding: 22px;
-            background: #eff6ff;
-            border-radius: 12px;
-            border-left: 6px solid #155eef;
-        }
+    .section-title {
+      margin: 0 0 4px;
+      font-size: 1.05rem;
+    }
 
-        .result-number {
-            font-size: 38px;
-            font-weight: bold;
-            color: #155eef;
-            margin: 10px 0;
-        }
+    .section-description {
+      margin: 0 0 16px;
+      color: var(--muted);
+      font-size: .9rem;
+    }
 
-        .result-sub {
-            color: #475569;
-            line-height: 1.8;
-        }
+    .group-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
 
-        .json-box {
-            margin-top: 16px;
-            padding: 16px;
-            background: #0f172a;
-            color: #e2e8f0;
-            border-radius: 10px;
-            white-space: pre-wrap;
-            font-family: Consolas, monospace;
-            font-size: 13px;
-            overflow-x: auto;
-        }
+    .group-option { position: relative; }
+    .group-option input { position: absolute; opacity: 0; pointer-events: none; }
 
-        details {
-            margin-top: 16px;
-        }
+    .group-card {
+      display: block;
+      min-height: 126px;
+      padding: 15px;
+      border: 2px solid var(--border);
+      border-radius: 14px;
+      background: var(--surface-soft);
+      cursor: pointer;
+      transition: border-color .18s ease, transform .18s ease, background .18s ease;
+    }
 
-        summary {
-            cursor: pointer;
-            font-weight: bold;
-            color: #155eef;
-        }
+    .group-card:hover { transform: translateY(-2px); border-color: #9abdb5; }
+    .group-option input:checked + .group-card {
+      border-color: var(--primary);
+      background: var(--primary-soft);
+      box-shadow: inset 0 0 0 1px var(--primary);
+    }
 
-        .dictionary {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 14px;
-            font-size: 14px;
-        }
+    .group-badge {
+      display: inline-block;
+      margin-bottom: 8px;
+      padding: 3px 7px;
+      border-radius: 999px;
+      background: #fff;
+      color: var(--primary);
+      font-size: .72rem;
+      font-weight: 800;
+    }
 
-        .dictionary th,
-        .dictionary td {
-            border: 1px solid #e2e8f0;
-            padding: 10px;
-            text-align: left;
-            vertical-align: top;
-        }
+    .group-card strong { display: block; font-size: .96rem; }
+    .group-card small { display: block; margin-top: 5px; color: var(--muted); line-height: 1.45; }
 
-        .dictionary th {
-            background: #f1f5f9;
-        }
+    .field-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 13px;
+    }
 
-        .badge {
-            display: inline-block;
-            padding: 4px 9px;
-            border-radius: 999px;
-            background: #dbeafe;
-            color: #1d4ed8;
-            font-size: 12px;
-            font-weight: bold;
-            margin-right: 6px;
-        }
+    .field {
+      display: block;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      background: var(--surface-soft);
+    }
 
-        .warning {
-            background: #fff7ed;
-            border-left: 6px solid #f97316;
-        }
+    .field-label-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: baseline;
+      margin-bottom: 7px;
+    }
 
-        .links a {
-            color: #155eef;
-            margin-right: 16px;
-            text-decoration: none;
-            font-weight: bold;
-        }
+    .field-label { font-size: .92rem; font-weight: 750; }
 
-        @media (max-width: 850px) {
-            .grid, .step-grid, .checkbox-area {
-                grid-template-columns: 1fr;
-            }
+    .feature-code {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: .72rem;
+    }
 
-            .hero h1 {
-                font-size: 25px;
-            }
-        }
-    </style>
+    .field-description {
+      display: block;
+      min-height: 2.6em;
+      margin-bottom: 9px;
+      color: var(--muted);
+      font-size: .78rem;
+      line-height: 1.45;
+    }
+
+    input[type="number"] {
+      width: 100%;
+      padding: 11px 12px;
+      border: 1px solid #cbd5dc;
+      border-radius: 9px;
+      background: #fff;
+      color: var(--text);
+      outline: none;
+      transition: border-color .16s ease, box-shadow .16s ease;
+    }
+
+    input[type="number"]:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(23,107,91,.12);
+    }
+
+    .toggle-field {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 94px;
+    }
+
+    .toggle-copy { padding-right: 12px; }
+    .toggle-copy .field-description { min-height: 0; margin: 4px 0 0; }
+
+    .switch { position: relative; flex: 0 0 auto; width: 48px; height: 27px; }
+    .switch input { position: absolute; opacity: 0; }
+    .switch-track {
+      position: absolute;
+      inset: 0;
+      border-radius: 999px;
+      background: #cbd5dc;
+      cursor: pointer;
+      transition: background .18s ease;
+    }
+    .switch-track::after {
+      content: "";
+      position: absolute;
+      width: 21px;
+      height: 21px;
+      left: 3px;
+      top: 3px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 2px 6px rgba(0,0,0,.18);
+      transition: transform .18s ease;
+    }
+    .switch input:checked + .switch-track { background: var(--primary); }
+    .switch input:checked + .switch-track::after { transform: translateX(21px); }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 26px;
+    }
+
+    .primary-button,
+    .secondary-button,
+    .preset-button {
+      border: 0;
+      border-radius: 11px;
+      cursor: pointer;
+      font-weight: 750;
+      transition: transform .15s ease, background .15s ease, box-shadow .15s ease;
+    }
+
+    .primary-button {
+      flex: 1 1 240px;
+      padding: 13px 22px;
+      background: var(--primary);
+      color: #fff;
+      box-shadow: 0 8px 18px rgba(23,107,91,.20);
+    }
+    .primary-button:hover { background: var(--primary-dark); transform: translateY(-1px); }
+
+    .secondary-button {
+      padding: 13px 17px;
+      border: 1px solid var(--border);
+      background: #fff;
+      color: var(--text);
+    }
+    .secondary-button:hover { background: var(--surface-soft); }
+
+    .preset-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .preset-label { width: 100%; color: var(--muted); font-size: .8rem; }
+    .preset-button {
+      padding: 7px 10px;
+      border: 1px solid var(--border);
+      background: var(--surface-soft);
+      color: var(--primary-dark);
+      font-size: .8rem;
+    }
+    .preset-button:hover { border-color: #9abdb5; background: var(--primary-soft); }
+
+    .sidebar { display: grid; gap: 16px; position: sticky; top: 18px; }
+
+    .result-card {
+      overflow: hidden;
+      border: 1px solid #b8d7cf;
+      border-radius: var(--radius-lg);
+      background: linear-gradient(145deg, #f0faf7, #ffffff);
+      box-shadow: 0 12px 32px rgba(23,107,91,.10);
+    }
+
+    .result-card.empty { border-color: var(--border); background: var(--surface); box-shadow: none; }
+
+    .result-top {
+      padding: 22px 22px 0;
+      color: var(--muted);
+      font-size: .84rem;
+      font-weight: 700;
+    }
+
+    .result-main { padding: 10px 22px 24px; }
+    .result-value {
+      display: flex;
+      align-items: baseline;
+      gap: 7px;
+      color: var(--primary-dark);
+    }
+    .result-value strong { font-size: clamp(2.5rem, 6vw, 4.1rem); line-height: 1; letter-spacing: -.05em; }
+    .result-value span { font-size: 1.05rem; font-weight: 700; }
+    .result-group { margin-top: 12px; color: var(--muted); font-size: .9rem; }
+
+    .empty-result {
+      padding: 26px 22px;
+      color: var(--muted);
+      text-align: center;
+    }
+    .empty-icon {
+      display: grid;
+      width: 52px;
+      height: 52px;
+      margin: 0 auto 12px;
+      place-items: center;
+      border-radius: 15px;
+      background: var(--primary-soft);
+      color: var(--primary);
+      font-size: 1.35rem;
+      font-weight: 900;
+    }
+
+    .error-card {
+      padding: 16px;
+      border: 1px solid #efb8b8;
+      border-radius: var(--radius-md);
+      background: var(--danger-soft);
+      color: var(--danger);
+      font-size: .9rem;
+    }
+
+    .info-card { padding: 20px; }
+    .info-card h3 { margin: 0 0 9px; font-size: 1rem; }
+    .info-card p, .info-card li { color: var(--muted); font-size: .86rem; }
+    .info-card ul { margin: 0; padding-left: 18px; }
+
+    .endpoint-links {
+      display: grid;
+      gap: 8px;
+      margin-top: 13px;
+    }
+    .endpoint-links a {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 9px 10px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--surface-soft);
+      text-decoration: none;
+      font-size: .8rem;
+      font-weight: 700;
+    }
+    .endpoint-links code { color: var(--muted); }
+
+    .footer {
+      margin-top: 24px;
+      color: var(--muted);
+      text-align: center;
+      font-size: .82rem;
+    }
+
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      .sidebar { position: static; grid-template-columns: repeat(2, minmax(0,1fr)); }
+    }
+
+    @media (max-width: 700px) {
+      .page-shell { width: min(100% - 20px, 1180px); padding-top: 10px; }
+      .hero { border-radius: 20px; }
+      .process-grid, .group-grid, .field-grid, .sidebar { grid-template-columns: 1fr; }
+      .process-card { padding: 14px; }
+      .panel-header, .panel-body { padding-left: 18px; padding-right: 18px; }
+      .group-card { min-height: auto; }
+      .field-description { min-height: 0; }
+    }
+  </style>
 </head>
 <body>
-    <div class="hero">
-        <div class="hero-inner">
-            <h1>食品の販売数を予測するデモ</h1>
-            <p>
-                この画面は、過去の販売数・最近の売れ行き・価格・曜日やイベント情報をもとに、食品商品の需要を予測するデモです。<br>
-                学習済みの機械学習モデルをAWS EC2上のFlask APIで動かし、ブラウザから予測できるようにしています。
-            </p>
+  <main class="page-shell">
+    <header class="hero">
+      <div class="hero-content">
+        <div class="eyebrow">PORTFOLIO / MACHINE LEARNING</div>
+        <h1>M5 食品需要予測デモ</h1>
+        <p>
+          過去の販売数、直近の需要、価格、イベント条件を入力し、
+          Kaggle M5データで学習したXGBoostモデルから予測販売数を算出します。
+        </p>
+        <div class="hero-tags">
+          <span class="hero-tag">XGBoost</span>
+          <span class="hero-tag">Flask API</span>
+          <span class="hero-tag">Time Series</span>
+          <span class="hero-tag">log1p Target</span>
         </div>
+        <div class="status-line">
+          <span id="status-dot" class="status-dot"></span>
+          <span id="status-text">API状態を確認しています</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="process-grid" aria-label="予測の流れ">
+      <div class="process-card">
+        <div class="process-number">1</div>
+        <div><strong>商品群を選択</strong><span>販売規模に対応するモデルを選びます。</span></div>
+      </div>
+      <div class="process-card">
+        <div class="process-number">2</div>
+        <div><strong>販売条件を入力</strong><span>過去実績、平均販売数、価格などを入力します。</span></div>
+      </div>
+      <div class="process-card">
+        <div class="process-number">3</div>
+        <div><strong>予測結果を確認</strong><span>推定された販売数を画面右側へ表示します。</span></div>
+      </div>
+    </section>
+
+    <div class="layout">
+      <section class="panel">
+        <div class="panel-header">
+          <h2>需要予測フォーム</h2>
+          <p>入力例を利用して、商品群ごとの予測結果をすぐに比較できます。</p>
+        </div>
+
+        <form method="post" id="forecast-form" class="panel-body">
+          <section class="form-section">
+            <h3 class="section-title">商品グループ</h3>
+            <p class="section-description">評価開始前の販売履歴から、販売規模別に固定した商品群です。</p>
+            <div class="group-grid">
+              {% for group in groups %}
+                <div class="group-option">
+                  <input
+                    type="radio"
+                    id="group-{{ group }}"
+                    name="sales_group"
+                    value="{{ group }}"
+                    {% if form_data.get('sales_group', 'top') == group %}checked{% endif %}
+                  >
+                  <label class="group-card" for="group-{{ group }}">
+                    <span class="group-badge">{{ group_meta[group].badge }}</span>
+                    <strong>{{ group_meta[group].label }}</strong>
+                    <small>{{ group_meta[group].description }}</small>
+                  </label>
+                </div>
+              {% endfor %}
+            </div>
+          </section>
+
+          {% for section_name, section_fields in sections.items() %}
+            <section class="form-section">
+              <h3 class="section-title">{{ section_name }}</h3>
+              <p class="section-description">{{ section_descriptions[section_name] }}</p>
+              <div class="field-grid">
+                {% for field in section_fields %}
+                  {% if field.get('type') == 'checkbox' %}
+                    <div class="field toggle-field">
+                      <div class="toggle-copy">
+                        <div class="field-label-row">
+                          <span class="field-label">{{ field.label }}</span>
+                          <span class="feature-code">{{ field.name }}</span>
+                        </div>
+                        <span class="field-description">{{ field.description }}</span>
+                      </div>
+                      <label class="switch" aria-label="{{ field.label }}">
+                        <input
+                          type="checkbox"
+                          name="{{ field.name }}"
+                          value="1"
+                          {% if form_data.get(field.name, '0')|string == '1' %}checked{% endif %}
+                        >
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                  {% else %}
+                    <label class="field">
+                      <span class="field-label-row">
+                        <span class="field-label">{{ field.label }}</span>
+                        <span class="feature-code">{{ field.name }}</span>
+                      </span>
+                      <span class="field-description">{{ field.description }}</span>
+                      <input
+                        type="number"
+                        name="{{ field.name }}"
+                        step="{{ field.get('step', 'any') }}"
+                        {% if field.get('min') is not none %}min="{{ field.min }}"{% endif %}
+                        value="{{ form_data.get(field.name, field.get('default', '0')) }}"
+                        inputmode="decimal"
+                        required
+                      >
+                    </label>
+                  {% endif %}
+                {% endfor %}
+              </div>
+            </section>
+          {% endfor %}
+
+          <div class="preset-row">
+            <span class="preset-label">サンプル値を入力</span>
+            <button type="button" class="preset-button" data-preset="top">よく売れる商品の例</button>
+            <button type="button" class="preset-button" data-preset="middle">平均的な商品の例</button>
+            <button type="button" class="preset-button" data-preset="bottom">あまり売れない商品の例</button>
+          </div>
+
+          <div class="actions">
+            <button type="submit" class="primary-button">予測を実行する</button>
+            <button type="reset" class="secondary-button">入力をリセット</button>
+          </div>
+        </form>
+      </section>
+
+      <aside class="sidebar">
+        {% if prediction is not none %}
+          <section class="result-card" aria-live="polite">
+            <div class="result-top">予測販売数</div>
+            <div class="result-main">
+              <div class="result-value">
+                <strong>{{ '%.2f'|format(prediction) }}</strong><span>個</span>
+              </div>
+              <div class="result-group">
+                {{ group_meta[selected_group].label }}のモデルで算出
+              </div>
+            </div>
+          </section>
+        {% else %}
+          <section class="result-card empty">
+            <div class="empty-result">
+              <div class="empty-icon">予</div>
+              <strong>ここに予測結果が表示されます</strong>
+              <p>フォームを入力して「予測を実行する」を押してください。</p>
+            </div>
+          </section>
+        {% endif %}
+
+        {% if error %}
+          <div class="error-card" role="alert">
+            <strong>予測できませんでした</strong><br>
+            {{ error }}
+          </div>
+        {% endif %}
+
+        <section class="panel info-card">
+          <h3>このデモについて</h3>
+          <ul>
+            <li>学習済みXGBoostモデルを使用</li>
+            <li>商品群ごとに別モデルを読み込み</li>
+            <li>予測値はlog1pから元スケールへ復元</li>
+          </ul>
+          <p>
+            画面にない特徴量は0で補完する、モデルとAPIの連携確認用デモです。
+            実務では商品IDと日付から全特徴量を自動生成します。
+          </p>
+        </section>
+
+        <section class="panel info-card">
+          <h3>API確認</h3>
+          <div class="endpoint-links">
+            <a href="/health" target="_blank" rel="noopener"><span>状態確認</span><code>/health</code></a>
+            <a href="/features/top" target="_blank" rel="noopener"><span>高需要モデル</span><code>/features/top</code></a>
+            <a href="/features/middle" target="_blank" rel="noopener"><span>中需要モデル</span><code>/features/middle</code></a>
+            <a href="/features/bottom" target="_blank" rel="noopener"><span>低需要モデル</span><code>/features/bottom</code></a>
+          </div>
+        </section>
+      </aside>
     </div>
 
-    <div class="container">
+    <footer class="footer">
+      M5 Forecasting Accuracy / Portfolio Demo
+    </footer>
+  </main>
 
-        <div class="card">
-            <h2>このデモの見方</h2>
-            <p class="lead">
-                難しい特徴量名を知らなくても使えるように、画面上では日本語の説明にしています。
-                内部ではKaggle M5データで作成した特徴量を使い、XGBoostモデルが予測を行います。
-            </p>
+  <script>
+    const presets = {{ presets | tojson }};
 
-            <div class="step-grid">
-                <div class="step-card">
-                    <strong>1. 商品タイプを選ぶ</strong><br>
-                    よく売れる商品、平均的な商品、あまり売れない商品から選びます。
-                </div>
-                <div class="step-card">
-                    <strong>2. 販売状況を入力</strong><br>
-                    1週間前の販売数や、直近の平均販売数を入力します。
-                </div>
-                <div class="step-card">
-                    <strong>3. 予測結果を見る</strong><br>
-                    モデルが予測した販売数を、画面に大きく表示します。
-                </div>
-            </div>
-        </div>
+    document.querySelectorAll('[data-preset]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const group = button.dataset.preset;
+        const values = presets[group];
+        const groupInput = document.querySelector(`input[name="sales_group"][value="${group}"]`);
+        if (groupInput) groupInput.checked = true;
 
-        <div class="card">
-            <h2>需要予測フォーム</h2>
+        Object.entries(values).forEach(([name, value]) => {
+          const input = document.querySelector(`[name="${name}"]`);
+          if (!input) return;
+          if (input.type === 'checkbox') {
+            input.checked = Number(value) === 1;
+          } else {
+            input.value = value;
+          }
+        });
+      });
+    });
 
-            <div class="form-section">
-                <h3>① 商品タイプ</h3>
-                <div class="grid">
-                    <div>
-                        <label>商品タイプ</label>
-                        <select id="sales_group">
-                            <option value="top">よく売れる商品</option>
-                            <option value="middle">平均的な商品</option>
-                            <option value="bottom">あまり売れない商品</option>
-                        </select>
-                        <div class="hint">
-                            商品を累計販売数で3つに分けています。売れ方によって効く特徴量が変わるためです。
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="form-section">
-                <h3>② 過去の販売数</h3>
-                <p class="lead">
-                    同じ商品の過去の販売数です。食品需要は周期性があるため、1週間前・2週間前などの売れ方が重要になります。
-                </p>
-
-                <div class="grid">
-                    <div>
-                        <label>1週間前の販売数 <span class="tech-name">lag_7</span></label>
-                        <input id="lag_7" type="number" step="0.1" value="10">
-                        <div class="hint">例：1週間前に10個売れたなら 10</div>
-                    </div>
-
-                    <div>
-                        <label>2週間前の販売数 <span class="tech-name">lag_14</span></label>
-                        <input id="lag_14" type="number" step="0.1" value="9">
-                        <div class="hint">例：2週間前に9個売れたなら 9</div>
-                    </div>
-
-                    <div>
-                        <label>3週間前の販売数 <span class="tech-name">lag_21</span></label>
-                        <input id="lag_21" type="number" step="0.1" value="8">
-                        <div class="hint">長めの周期を見るために使います。</div>
-                    </div>
-
-                    <div>
-                        <label>4週間前の販売数 <span class="tech-name">lag_28</span></label>
-                        <input id="lag_28" type="number" step="0.1" value="11">
-                        <div class="hint">約1か月前の販売数です。</div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="form-section">
-                <h3>③ 最近の売れ行き</h3>
-                <p class="lead">
-                    一日だけの販売数ではなく、直近数日間の平均を見ることで、一時的なブレを減らします。
-                </p>
-
-                <div class="grid">
-                    <div>
-                        <label>直近1週間の平均販売数 <span class="tech-name">rolling_mean_7</span></label>
-                        <input id="rolling_mean_7" type="number" step="0.1" value="10.5">
-                        <div class="hint">最近よく売れているかを見る指標です。</div>
-                    </div>
-
-                    <div>
-                        <label>直近2週間の平均販売数 <span class="tech-name">rolling_mean_14</span></label>
-                        <input id="rolling_mean_14" type="number" step="0.1" value="9.8">
-                        <div class="hint">1週間平均より少し安定した傾向を見ます。</div>
-                    </div>
-
-                    <div>
-                        <label>直近4週間の平均販売数 <span class="tech-name">rolling_mean_28</span></label>
-                        <input id="rolling_mean_28" type="number" step="0.1" value="9.2">
-                        <div class="hint">長めの販売傾向を見る指標です。</div>
-                    </div>
-
-                    <div>
-                        <label>曜日を考慮した最近の売れ行き <span class="tech-name">dow_ratio_x_rolling_mean_7</span></label>
-                        <input id="dow_ratio_x_rolling_mean_7" type="number" step="0.1" value="12.0">
-                        <div class="hint">
-                            「週末に売れやすい」などの曜日効果と、最近の売れ行きを組み合わせた指標です。
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="form-section">
-                <h3>④ 価格・カレンダー条件</h3>
-                <p class="lead">
-                    価格、週末、イベント日などは食品の販売数に影響するため、補助情報として使います。
-                </p>
-
-                <div class="grid">
-                    <div>
-                        <label>販売価格 <span class="tech-name">sell_price</span></label>
-                        <input id="sell_price" type="number" step="0.1" value="3.5">
-                        <div class="hint">商品の価格です。例：3.5ドルなら 3.5</div>
-                    </div>
-                </div>
-
-                <div class="checkbox-area">
-                    <div class="check-card">
-                        <label><input id="is_weekend" type="checkbox" checked> 週末</label>
-                        <div class="hint">土日など、平日とは買われ方が変わりやすい日です。</div>
-                    </div>
-
-                    <div class="check-card">
-                        <label><input id="snap" type="checkbox"> SNAP対象日</label>
-                        <div class="hint">米国の食品購買支援制度の対象日です。食品カテゴリでは重要になる場合があります。</div>
-                    </div>
-
-                    <div class="check-card">
-                        <label><input id="has_event" type="checkbox"> 祝日・イベント日</label>
-                        <div class="hint">スポーツイベントや祝日など、需要が変わる可能性がある日です。</div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="button-row">
-                <button onclick="predict()">予測する</button>
-                <button class="secondary" onclick="setExample('top')">よく売れる商品の例</button>
-                <button class="secondary" onclick="setExample('middle')">平均的な商品の例</button>
-                <button class="secondary" onclick="setExample('bottom')">あまり売れない商品の例</button>
-            </div>
-
-            <div id="result" class="result-main">
-                <strong>予測結果</strong>
-                <div class="result-sub">
-                    「予測する」ボタンを押すと、ここに予測販売数が表示されます。
-                </div>
-            </div>
-
-            <details>
-                <summary>技術者向け：APIのJSONレスポンスを見る</summary>
-                <div id="jsonResult" class="json-box">API response JSON will appear here.</div>
-            </details>
-        </div>
-
-        <div class="card warning">
-            <h2>確認してほしいポイント</h2>
-            <ul>
-                <li><span class="badge">機械学習</span> 学習済みXGBoostモデルで予測している</li>
-                <li><span class="badge">Linux</span> Lubuntuで学習・モデル生成済み</li>
-                <li><span class="badge">AWS</span> S3に保存したモデルをEC2側で利用している</li>
-                <li><span class="badge">API</span> Flask APIとして `/predict` を公開している</li>
-                <li><span class="badge">画面</span> HTMLフォームから予測できる</li>
-            </ul>
-
-            <p class="lead">
-                この画面はポートフォリオ用の軽量デモです。
-                実務では、商品IDと日付を入力すると、API側で必要な特徴量を自動生成する構成に発展できます。
-            </p>
-        </div>
-
-        <div class="card">
-            <h2>特徴量名の対応表</h2>
-            <p class="lead">
-                画面では分かりやすい日本語名にしていますが、内部では以下の特徴量名を使っています。
-            </p>
-
-            <table class="dictionary">
-                <tr>
-                    <th>画面での表記</th>
-                    <th>内部の特徴量名</th>
-                    <th>意味</th>
-                </tr>
-                <tr>
-                    <td>1週間前の販売数</td>
-                    <td>lag_7</td>
-                    <td>7日前に売れた個数</td>
-                </tr>
-                <tr>
-                    <td>2週間前の販売数</td>
-                    <td>lag_14</td>
-                    <td>14日前に売れた個数</td>
-                </tr>
-                <tr>
-                    <td>直近1週間の平均販売数</td>
-                    <td>rolling_mean_7</td>
-                    <td>最近7日間の平均販売数</td>
-                </tr>
-                <tr>
-                    <td>曜日を考慮した最近の売れ行き</td>
-                    <td>dow_ratio_x_rolling_mean_7</td>
-                    <td>曜日による売れやすさと、最近の売れ行きを組み合わせた特徴量</td>
-                </tr>
-                <tr>
-                    <td>販売価格</td>
-                    <td>sell_price</td>
-                    <td>商品の販売価格</td>
-                </tr>
-            </table>
-        </div>
-
-        <div class="card">
-            <h2>API確認用リンク</h2>
-            <div class="links">
-                <a href="/health" target="_blank">API状態確認</a>
-                <a href="/features/top" target="_blank">よく売れる商品の特徴量一覧</a>
-                <a href="/features/middle" target="_blank">平均的な商品の特徴量一覧</a>
-                <a href="/features/bottom" target="_blank">あまり売れない商品の特徴量一覧</a>
-            </div>
-        </div>
-
-    </div>
-
-    <script>
-        function getNumber(id) {
-            return Number(document.getElementById(id).value);
+    fetch('/health')
+      .then((response) => {
+        if (!response.ok) throw new Error('health check failed');
+        return response.json();
+      })
+      .then((data) => {
+        const models = data.models || {};
+        const readyCount = Object.values(models).filter(Boolean).length;
+        const dot = document.getElementById('status-dot');
+        const text = document.getElementById('status-text');
+        if (readyCount === 3) {
+          dot.classList.add('online');
+          text.textContent = 'API稼働中・3モデル読み込み可能';
+        } else {
+          dot.classList.add('offline');
+          text.textContent = `API稼働中・モデル ${readyCount}/3`; 
         }
-
-        function setValue(id, value) {
-            document.getElementById(id).value = value;
-        }
-
-        function setCheck(id, value) {
-            document.getElementById(id).checked = value;
-        }
-
-        function setExample(type) {
-            document.getElementById("sales_group").value = type;
-
-            if (type === "top") {
-                setValue("lag_7", 10);
-                setValue("lag_14", 9);
-                setValue("lag_21", 8);
-                setValue("lag_28", 11);
-                setValue("rolling_mean_7", 10.5);
-                setValue("rolling_mean_14", 9.8);
-                setValue("rolling_mean_28", 9.2);
-                setValue("sell_price", 3.5);
-                setValue("dow_ratio_x_rolling_mean_7", 12.0);
-                setCheck("is_weekend", true);
-                setCheck("snap", false);
-                setCheck("has_event", false);
-            }
-
-            if (type === "middle") {
-                setValue("lag_7", 2);
-                setValue("lag_14", 1);
-                setValue("lag_21", 1);
-                setValue("lag_28", 2);
-                setValue("rolling_mean_7", 1.8);
-                setValue("rolling_mean_14", 1.6);
-                setValue("rolling_mean_28", 1.5);
-                setValue("sell_price", 2.8);
-                setValue("dow_ratio_x_rolling_mean_7", 2.0);
-                setCheck("is_weekend", false);
-                setCheck("snap", true);
-                setCheck("has_event", false);
-            }
-
-            if (type === "bottom") {
-                setValue("lag_7", 0);
-                setValue("lag_14", 1);
-                setValue("lag_21", 0);
-                setValue("lag_28", 0);
-                setValue("rolling_mean_7", 0.4);
-                setValue("rolling_mean_14", 0.3);
-                setValue("rolling_mean_28", 0.2);
-                setValue("sell_price", 1.9);
-                setValue("dow_ratio_x_rolling_mean_7", 0.3);
-                setCheck("is_weekend", false);
-                setCheck("snap", false);
-                setCheck("has_event", true);
-            }
-        }
-
-        function makeInterpretation(predictedSales, salesGroup) {
-            let groupText = {
-                "top": "よく売れる商品",
-                "middle": "平均的な商品",
-                "bottom": "あまり売れない商品"
-            }[salesGroup];
-
-            let level = "少なめ";
-            if (predictedSales >= 10) {
-                level = "多め";
-            } else if (predictedSales >= 2) {
-                level = "中くらい";
-            }
-
-            return `${groupText}として、次の需要は${level}と推定されます。`;
-        }
-
-        async function predict() {
-            const payload = {
-                sales_group: document.getElementById("sales_group").value,
-                features: {
-                    lag_7: getNumber("lag_7"),
-                    lag_14: getNumber("lag_14"),
-                    lag_21: getNumber("lag_21"),
-                    lag_28: getNumber("lag_28"),
-                    rolling_mean_7: getNumber("rolling_mean_7"),
-                    rolling_mean_14: getNumber("rolling_mean_14"),
-                    rolling_mean_28: getNumber("rolling_mean_28"),
-                    sell_price: getNumber("sell_price"),
-                    is_weekend: document.getElementById("is_weekend").checked ? 1 : 0,
-                    snap: document.getElementById("snap").checked ? 1 : 0,
-                    has_event: document.getElementById("has_event").checked ? 1 : 0,
-                    dow_ratio_x_rolling_mean_7: getNumber("dow_ratio_x_rolling_mean_7")
-                }
-            };
-
-            const resultArea = document.getElementById("result");
-            const jsonArea = document.getElementById("jsonResult");
-
-            resultArea.innerHTML = "<strong>予測中...</strong>";
-            jsonArea.textContent = "Waiting for API response...";
-
-            try {
-                const response = await fetch("/predict", {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json"
-                    },
-                    body: JSON.stringify(payload)
-                });
-
-                const data = await response.json();
-
-                if (!response.ok) {
-                    resultArea.innerHTML = "<strong>エラーが発生しました</strong><div class='result-sub'>入力内容またはAPIの状態を確認してください。</div>";
-                    jsonArea.textContent = JSON.stringify(data, null, 2);
-                    return;
-                }
-
-                const predicted = data.predicted_sales;
-                const interpretation = makeInterpretation(predicted, data.sales_group);
-
-                resultArea.innerHTML = `
-                    <strong>予測結果</strong>
-                    <div class="result-number">約 ${predicted} 個</div>
-                    <div class="result-sub">
-                        この条件では、次に売れる数量は <strong>約 ${predicted} 個</strong> と予測されました。<br>
-                        商品タイプ：${document.getElementById("sales_group").selectedOptions[0].text}<br>
-                        使用モデル：${data.model_variant}<br>
-                        解釈：${interpretation}<br>
-                        補足：このデモでは、画面に出していない詳細特徴量 ${data.missing_feature_count} 個は0で補完しています。
-                    </div>
-                `;
-
-                jsonArea.textContent = JSON.stringify(data, null, 2);
-            } catch (error) {
-                resultArea.innerHTML = "<strong>通信エラー</strong><div class='result-sub'>EC2のAPIが起動しているか、Security Groupの5000番ポートが開いているか確認してください。</div>";
-                jsonArea.textContent = String(error);
-            }
-        }
-    </script>
+      })
+      .catch(() => {
+        document.getElementById('status-dot').classList.add('offline');
+        document.getElementById('status-text').textContent = 'API状態を取得できませんでした';
+      });
+  </script>
 </body>
 </html>
 """
 
 
-def load_models():
-    for group, filename in MODEL_FILES.items():
-        model_path = MODEL_DIR / filename
-
-        if not model_path.exists():
-            raise FileNotFoundError(f"Model file not found: {model_path}")
-
-        models[group] = joblib.load(model_path)
-
-    print("Loaded models:", list(models.keys()))
+def grouped_fields() -> dict[str, list[dict[str, str]]]:
+    """画面表示用に特徴量をセクション単位へまとめる。"""
+    sections: dict[str, list[dict[str, str]]] = {}
+    for field in FEATURE_FIELDS:
+        sections.setdefault(field["section"], []).append(field)
+    return sections
 
 
-def get_feature_names(model):
-    if hasattr(model, "feature_names_in_"):
-        return list(model.feature_names_in_)
-
-    if hasattr(model, "get_booster"):
-        feature_names = model.get_booster().feature_names
-        if feature_names is not None:
-            return list(feature_names)
-
-    raise ValueError("Could not detect feature names from model.")
+def model_path(group: str) -> Path:
+    if group not in GROUPS:
+        raise ValueError(f"sales_group must be one of {GROUPS}")
+    return MODELS_DIR / f"xgboost_log1p_{group}.joblib"
 
 
-@app.route("/", methods=["GET"])
-def index():
-    return render_template_string(HTML_PAGE)
+@lru_cache(maxsize=3)
+def load_model(group: str) -> Any:
+    path = model_path(group)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Model file was not found: {path}. Run the notebook to generate models."
+        )
+    return joblib.load(path)
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "status": "ok",
-        "loaded_models": list(models.keys()),
-        "model_dir": str(MODEL_DIR)
-    })
+def feature_names(model: Any) -> list[str]:
+    names = getattr(model, "feature_names_in_", None)
+    if names is not None:
+        return [str(name) for name in names]
+    booster = getattr(model, "get_booster", lambda: None)()
+    names = getattr(booster, "feature_names", None)
+    if names:
+        return [str(name) for name in names]
+    raise ValueError("The model does not expose feature names.")
 
 
-@app.route("/features/<sales_group>", methods=["GET"])
-def features(sales_group):
-    if sales_group not in models:
-        return jsonify({
-            "error": "Invalid sales_group",
-            "allowed_sales_groups": list(models.keys())
-        }), 400
-
-    feature_names = get_feature_names(models[sales_group])
-
-    return jsonify({
-        "sales_group": sales_group,
-        "feature_count": len(feature_names),
-        "features": feature_names
-    })
+def parse_number(value: Any, name: str) -> float:
+    if value in (None, ""):
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be numeric") from exc
+    if not np.isfinite(number):
+        raise ValueError(f"{name} must be finite")
+    return number
 
 
-@app.route("/predict", methods=["POST"])
-def predict():
-    data = request.get_json()
+def make_frame(model: Any, payload: dict[str, Any]) -> pd.DataFrame:
+    names = feature_names(model)
+    values = {name: parse_number(payload.get(name, 0.0), name) for name in names}
+    return pd.DataFrame([values], columns=names)
 
-    if data is None:
-        return jsonify({
-            "error": "Request body must be JSON."
-        }), 400
 
-    sales_group = data.get("sales_group")
-    input_features = data.get("features", {})
+def predict(group: str, payload: dict[str, Any]) -> float:
+    model = load_model(group)
+    frame = make_frame(model, payload)
+    log_prediction = float(model.predict(frame)[0])
+    return max(0.0, float(np.expm1(log_prediction)))
 
-    if sales_group not in models:
-        return jsonify({
-            "error": "Invalid sales_group",
-            "allowed_sales_groups": list(models.keys())
-        }), 400
 
-    if not isinstance(input_features, dict):
-        return jsonify({
-            "error": "features must be a JSON object."
-        }), 400
+@app.get("/health")
+def health() -> Any:
+    available = {group: model_path(group).is_file() for group in GROUPS}
+    return jsonify({"status": "ok", "models": available})
 
-    model = models[sales_group]
-    feature_names = get_feature_names(model)
 
-    row = {}
-    missing_features = []
+@app.get("/features/<group>")
+def features(group: str) -> Any:
+    try:
+        model = load_model(group)
+        return jsonify({"sales_group": group, "features": feature_names(model)})
+    except (ValueError, FileNotFoundError) as exc:
+        return jsonify({"error": str(exc)}), 400
 
-    for feature in feature_names:
-        if feature in input_features:
-            row[feature] = input_features[feature]
-        else:
-            row[feature] = 0
-            missing_features.append(feature)
 
-    X = pd.DataFrame([row], columns=feature_names)
+@app.post("/predict")
+def predict_endpoint() -> Any:
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    group = str(payload.get("sales_group", "top"))
+    try:
+        value = predict(group, payload)
+        return jsonify({"sales_group": group, "prediction": value})
+    except (ValueError, FileNotFoundError) as exc:
+        return jsonify({"error": str(exc)}), 400
 
-    pred_log = model.predict(X)[0]
-    pred_sales = float(np.expm1(pred_log))
-    pred_sales = max(0.0, pred_sales)
 
-    return jsonify({
-        "sales_group": sales_group,
-        "model_variant": "xgboost_log1p",
-        "predicted_sales": round(pred_sales, 3),
-        "missing_feature_count": len(missing_features),
-        "note": "Missing features were filled with 0. For production use, generate all features from the same feature pipeline."
-    })
+@app.route("/", methods=["GET", "POST"])
+def index() -> str:
+    prediction_value = None
+    error = None
+    form_data = dict(DEFAULT_FORM)
+    selected_group = "top"
+
+    if request.method == "POST":
+        form_data.update(request.form.to_dict())
+        selected_group = request.form.get("sales_group", "top")
+        form_data["sales_group"] = selected_group
+        try:
+            prediction_value = predict(selected_group, request.form.to_dict())
+        except (ValueError, FileNotFoundError) as exc:
+            error = str(exc)
+    else:
+        selected_group = form_data["sales_group"]
+
+    return render_template_string(
+        HTML,
+        groups=GROUPS,
+        group_meta=GROUP_META,
+        sections=grouped_fields(),
+        section_descriptions=SECTION_DESCRIPTIONS,
+        presets=EXAMPLE_PRESETS,
+        form_data=form_data,
+        selected_group=selected_group,
+        prediction=prediction_value,
+        error=error,
+    )
 
 
 if __name__ == "__main__":
-    load_models()
     app.run(host="0.0.0.0", port=5000, debug=False)

@@ -45,3 +45,6 @@ kagglehub/
 
 # Executed notebooks
 notebooks/executed_*.ipynb
+
+# Kaggle M5 raw data
+data/raw/

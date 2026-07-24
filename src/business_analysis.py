@@ -1,454 +1,373 @@
-from pathlib import Path
+"""M5 FOODSカテゴリの事業分析。
 
+評価開始前の履歴だけで固定した商品グループを使い、販売傾向、ゼロ販売率、
+イベント、SNAP、価格帯との関係を集計してCSVと画像を出力します。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib import font_manager
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-DATA_DIR_CANDIDATES = [
-    PROJECT_ROOT / "data",
-    PROJECT_ROOT / "data" / "raw",
-    PROJECT_ROOT / "input",
-    PROJECT_ROOT / "m5-forecasting-accuracy",
-]
-
+from src.item_grouping import apply_item_groups, select_item_groups
 RESULTS_DIR = PROJECT_ROOT / "results"
 IMAGES_DIR = PROJECT_ROOT / "images"
+GROUPING_CUTOFF_DATE = "2015-10-01"
+ITEMS_PER_GROUP = 30
+GROUP_ORDER = ["top", "middle", "bottom"]
 
-RESULTS_DIR.mkdir(exist_ok=True)
-IMAGES_DIR.mkdir(exist_ok=True)
-
-
-GROUP_LABELS = {
-    "top": "top（よく売れる商品）",
-    "middle": "middle（平均的な商品）",
-    "bottom": "bottom（あまり売れない商品）",
-}
-
-GROUP_ORDER = {
-    "top": 0,
-    "middle": 1,
-    "bottom": 2,
-}
-
-PRICE_BIN_LABELS = {
-    "low": "低価格",
-    "mid_low": "やや低価格",
-    "mid_high": "やや高価格",
-    "high": "高価格",
-}
-
-
-def setup_japanese_font() -> None:
-    """
-    Matplotlibで日本語が文字化けしにくいように、利用可能な日本語フォントを設定します。
-    Windowsなら Yu Gothic / Meiryo、Linuxなら Noto Sans CJK JP などを優先します。
-    """
-    preferred_fonts = [
-        "Yu Gothic",
-        "Yu Gothic UI",
-        "Meiryo",
-        "MS Gothic",
-        "Noto Sans CJK JP",
-        "Noto Sans JP",
-        "IPAexGothic",
-        "IPAGothic",
-        "TakaoGothic",
-        "DejaVu Sans",
-    ]
-
-    installed_fonts = {font.name for font in font_manager.fontManager.ttflist}
-
-    for font_name in preferred_fonts:
-        if font_name in installed_fonts:
-            plt.rcParams["font.family"] = font_name
-            break
-
-    # マイナス記号の文字化け対策
-    plt.rcParams["axes.unicode_minus"] = False
+DATA_SEARCH_DIRS = (
+    PROJECT_ROOT / "data" / "raw",
+    PROJECT_ROOT / "data",
+    PROJECT_ROOT / "input",
+    PROJECT_ROOT / "m5-forecasting-accuracy",
+)
 
 
 def find_data_file(filename: str) -> Path:
-    for data_dir in DATA_DIR_CANDIDATES:
-        path = data_dir / filename
-        if path.exists():
-            return path
-
+    """既知の保存場所からM5ファイルを検索する。"""
+    for base_dir in DATA_SEARCH_DIRS:
+        direct = base_dir / filename
+        if direct.is_file():
+            return direct
+        if base_dir.is_dir():
+            matches = list(base_dir.rglob(filename))
+            if matches:
+                return matches[0]
+    searched = ", ".join(str(path.relative_to(PROJECT_ROOT)) for path in DATA_SEARCH_DIRS)
     raise FileNotFoundError(
-        f"{filename} was not found. "
-        "Please place Kaggle M5 files under data/, data/raw/, input/, "
-        "or m5-forecasting-accuracy/."
+        f"{filename} was not found. Please place Kaggle M5 files under {searched}."
     )
 
 
-def load_m5_data():
-    sales_path = find_data_file("sales_train_validation.csv")
-    calendar_path = find_data_file("calendar.csv")
-    prices_path = find_data_file("sell_prices.csv")
-
-    print(f"Loading sales data: {sales_path}")
-    sales = pd.read_csv(sales_path)
-
-    print(f"Loading calendar data: {calendar_path}")
-    calendar = pd.read_csv(calendar_path)
-
-    print(f"Loading price data: {prices_path}")
-    prices = pd.read_csv(prices_path)
-
+def load_m5_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    sales = pd.read_csv(find_data_file("sales_train_validation.csv"))
+    calendar = pd.read_csv(find_data_file("calendar.csv"))
+    prices = pd.read_csv(find_data_file("sell_prices.csv"))
+    calendar["date"] = pd.to_datetime(calendar["date"], errors="raise")
     return sales, calendar, prices
 
 
-def assign_sales_group(food_sales: pd.DataFrame, day_cols: list[str]) -> pd.DataFrame:
-    """
-    各商品・店舗行の累計販売数をもとに top / middle / bottom を付与します。
-    """
-    food_sales = food_sales.copy()
-    food_sales["total_sales"] = food_sales[day_cols].sum(axis=1)
-
-    # 同じ販売数が多い場合でもqcutが失敗しにくいようにrankを使います。
-    ranked_total = food_sales["total_sales"].rank(method="first")
-
-    food_sales["sales_group"] = pd.qcut(
-        ranked_total,
-        q=3,
-        labels=["bottom", "middle", "top"],
-    )
-
-    food_sales["sales_group"] = food_sales["sales_group"].astype(str)
-    return food_sales
-
-
-def create_group_summary(food_sales: pd.DataFrame, day_cols: list[str]) -> pd.DataFrame:
-    summary_rows = []
-
-    for group_name, group_df in food_sales.groupby("sales_group"):
-        values = group_df[day_cols].to_numpy()
-
-        summary_rows.append(
-            {
-                "sales_group": group_name,
-                "販売グループ": GROUP_LABELS.get(group_name, group_name),
-                "商品_店舗数": len(group_df),
-                "累計販売数": float(values.sum()),
-                "1日あたり平均販売数": float(values.mean()),
-                "1日あたり中央値": float(np.median(values)),
-                "販売数が0だった日の割合": float((values == 0).mean()),
-                "最大日次販売数": float(values.max()),
-            }
-        )
-
-    summary = pd.DataFrame(summary_rows)
-    summary["sort_order"] = summary["sales_group"].map(GROUP_ORDER)
-    summary = summary.sort_values("sort_order").drop(columns=["sort_order", "sales_group"])
-
-    output_path = RESULTS_DIR / "business_analysis_summary.csv"
-    summary.to_csv(output_path, index=False, encoding="utf-8-sig")
-    print(f"Saved: {output_path}")
-
-    return summary
-
-
-def plot_sales_trend_by_group(food_sales: pd.DataFrame, calendar: pd.DataFrame, day_cols: list[str]):
-    trend_rows = []
-
-    for group_name, group_df in food_sales.groupby("sales_group"):
-        daily_sales = group_df[day_cols].sum(axis=0)
-        temp = pd.DataFrame(
-            {
-                "d": daily_sales.index,
-                "販売数": daily_sales.values,
-                "sales_group": group_name,
-                "販売グループ": GROUP_LABELS.get(group_name, group_name),
-            }
-        )
-        trend_rows.append(temp)
-
-    trend = pd.concat(trend_rows, ignore_index=True)
-    trend = trend.merge(calendar[["d", "date"]], on="d", how="left")
-    trend["date"] = pd.to_datetime(trend["date"])
-
-    plt.figure(figsize=(12, 6))
-    for _, group_df in trend.groupby("販売グループ"):
-        group_df = group_df.sort_values("date")
-        rolling_sales = group_df["販売数"].rolling(28, min_periods=1).mean()
-        plt.plot(group_df["date"], rolling_sales, label=group_df["販売グループ"].iloc[0])
-
-    plt.title("販売規模別の販売数推移（28日移動平均）")
-    plt.xlabel("日付")
-    plt.ylabel("販売数合計")
-    plt.legend()
-    plt.tight_layout()
-
-    output_path = IMAGES_DIR / "business_sales_trend_by_group.png"
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-    print(f"Saved: {output_path}")
-
-
-def plot_zero_rate_by_group(summary: pd.DataFrame):
-    plot_df = summary.copy()
-
-    plt.figure(figsize=(9, 5))
-    plt.bar(plot_df["販売グループ"], plot_df["販売数が0だった日の割合"])
-    plt.title("商品グループ別：販売数が0だった日の割合")
-    plt.xlabel("商品グループ")
-    plt.ylabel("販売数が0だった日の割合")
-    plt.ylim(0, 1)
-    plt.xticks(rotation=15)
-    plt.tight_layout()
-
-    output_path = IMAGES_DIR / "business_zero_rate_by_group.png"
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-    print(f"Saved: {output_path}")
-
-
-def create_state_group_daily_sales(food_sales: pd.DataFrame, calendar: pd.DataFrame, day_cols: list[str]):
-    """
-    SNAPは州ごとに対象日が異なるため、sales_group × state_id 単位で日別販売数を集計します。
-    """
-    rows = []
-
-    for (group_name, state_id), group_df in food_sales.groupby(["sales_group", "state_id"]):
-        daily_sales = group_df[day_cols].sum(axis=0)
-
-        temp = pd.DataFrame(
-            {
-                "d": daily_sales.index,
-                "販売数": daily_sales.values,
-                "sales_group": group_name,
-                "販売グループ": GROUP_LABELS.get(group_name, group_name),
-                "state_id": state_id,
-            }
-        )
-        rows.append(temp)
-
-    daily = pd.concat(rows, ignore_index=True)
-
-    calendar_cols = [
-        "d",
-        "date",
-        "event_name_1",
-        "event_name_2",
-        "snap_CA",
-        "snap_TX",
-        "snap_WI",
-    ]
-    available_cols = [col for col in calendar_cols if col in calendar.columns]
-    daily = daily.merge(calendar[available_cols], on="d", how="left")
-    daily["date"] = pd.to_datetime(daily["date"])
-
-    event_1 = daily["event_name_1"].notna() if "event_name_1" in daily.columns else False
-    event_2 = daily["event_name_2"].notna() if "event_name_2" in daily.columns else False
-    daily["イベント日"] = (event_1 | event_2).astype(int)
-
-    def get_snap(row):
-        snap_col = f"snap_{row['state_id']}"
-        if snap_col in row.index:
-            return row[snap_col]
-        return 0
-
-    daily["SNAP対象日"] = daily.apply(get_snap, axis=1).fillna(0).astype(int)
-
-    return daily
-
-
-def plot_event_snap_impact(daily: pd.DataFrame):
-    event_summary = (
-        daily.groupby(["販売グループ", "イベント日"])["販売数"]
-        .mean()
-        .reset_index()
-    )
-
-    snap_summary = (
-        daily.groupby(["販売グループ", "SNAP対象日"])["販売数"]
-        .mean()
-        .reset_index()
-    )
-
-    event_pivot = event_summary.pivot(
-        index="販売グループ",
-        columns="イベント日",
-        values="販売数",
-    ).fillna(0)
-
-    snap_pivot = snap_summary.pivot(
-        index="販売グループ",
-        columns="SNAP対象日",
-        values="販売数",
-    ).fillna(0)
-
-    event_pivot = event_pivot.rename(columns={0: "通常日", 1: "イベント日"})
-    snap_pivot = snap_pivot.rename(columns={0: "SNAP対象外", 1: "SNAP対象日"})
-
-    event_output = RESULTS_DIR / "business_event_impact_summary.csv"
-    snap_output = RESULTS_DIR / "business_snap_impact_summary.csv"
-
-    event_pivot.to_csv(event_output, encoding="utf-8-sig")
-    snap_pivot.to_csv(snap_output, encoding="utf-8-sig")
-
-    print(f"Saved: {event_output}")
-    print(f"Saved: {snap_output}")
-
-    plt.figure(figsize=(9, 5))
-    event_pivot.plot(kind="bar", ax=plt.gca())
-    plt.title("イベント日と通常日の平均販売数比較")
-    plt.xlabel("販売グループ")
-    plt.ylabel("平均販売数")
-    plt.xticks(rotation=15)
-    plt.tight_layout()
-
-    output_path = IMAGES_DIR / "business_event_impact.png"
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-    print(f"Saved: {output_path}")
-
-    plt.figure(figsize=(9, 5))
-    snap_pivot.plot(kind="bar", ax=plt.gca())
-    plt.title("SNAP対象日と非対象日の平均販売数比較")
-    plt.xlabel("販売グループ")
-    plt.ylabel("平均販売数")
-    plt.xticks(rotation=15)
-    plt.tight_layout()
-
-    output_path = IMAGES_DIR / "business_snap_impact.png"
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-    print(f"Saved: {output_path}")
-
-
-def analyze_price_vs_sales(
-    food_sales: pd.DataFrame,
+def prepare_long_data(
+    sales: pd.DataFrame,
     calendar: pd.DataFrame,
     prices: pd.DataFrame,
-    day_cols: list[str],
-    recent_days: int = 180,
-):
-    """
-    価格分析はデータ量が大きくなりやすいため、直近日数だけを使います。
-    """
-    recent_day_cols = day_cols[-recent_days:]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """FOODS商品を固定グループ化し、縦持ち・結合済みデータを返す。"""
+    foods = sales.loc[sales["cat_id"].eq("FOODS")].copy()
+    if foods.empty:
+        raise ValueError("FOODS category was not found in sales data.")
 
-    id_cols = [
-        "id",
-        "item_id",
-        "dept_id",
-        "cat_id",
-        "store_id",
-        "state_id",
-        "sales_group",
+    selected_path = RESULTS_DIR / "selected_item_groups.csv"
+    selected = select_item_groups(
+        foods,
+        calendar,
+        cutoff_date=GROUPING_CUTOFF_DATE,
+        items_per_group=ITEMS_PER_GROUP,
+        output_path=selected_path,
+    )
+    grouped = apply_item_groups(foods, selected)
+
+    day_columns = [column for column in grouped.columns if column.startswith("d_")]
+    id_columns = [
+        column
+        for column in (
+            "id",
+            "item_id",
+            "dept_id",
+            "cat_id",
+            "store_id",
+            "state_id",
+            "sales_group",
+        )
+        if column in grouped.columns
     ]
-
-    print(f"Creating price analysis data for recent {recent_days} days...")
-
-    long_sales = food_sales[id_cols + recent_day_cols].melt(
-        id_vars=id_cols,
-        value_vars=recent_day_cols,
+    long_sales = grouped.melt(
+        id_vars=id_columns,
+        value_vars=day_columns,
         var_name="d",
         value_name="sales",
     )
 
-    calendar_small = calendar[["d", "wm_yr_wk"]]
-    long_sales = long_sales.merge(calendar_small, on="d", how="left")
-
-    long_sales = long_sales.merge(
+    calendar_columns = [
+        column
+        for column in (
+            "d",
+            "date",
+            "wm_yr_wk",
+            "weekday",
+            "wday",
+            "month",
+            "year",
+            "event_name_1",
+            "event_type_1",
+            "event_name_2",
+            "event_type_2",
+            "snap_CA",
+            "snap_TX",
+            "snap_WI",
+        )
+        if column in calendar.columns
+    ]
+    merged = long_sales.merge(
+        calendar[calendar_columns], on="d", how="left", validate="many_to_one"
+    )
+    merged = merged.merge(
         prices[["store_id", "item_id", "wm_yr_wk", "sell_price"]],
         on=["store_id", "item_id", "wm_yr_wk"],
         how="left",
+        validate="many_to_one",
     )
+    merged["date"] = pd.to_datetime(merged["date"], errors="coerce")
+    merged["sales"] = pd.to_numeric(merged["sales"], errors="coerce").fillna(0.0)
+    merged["is_zero_sale"] = merged["sales"].eq(0)
+    merged["has_event"] = merged[["event_name_1", "event_name_2"]].notna().any(axis=1)
 
-    long_sales = long_sales.dropna(subset=["sell_price"])
+    snap_columns = {"CA": "snap_CA", "TX": "snap_TX", "WI": "snap_WI"}
+    merged["is_snap_day"] = 0
+    for state_id, column in snap_columns.items():
+        if column in merged.columns:
+            mask = merged["state_id"].eq(state_id)
+            merged.loc[mask, "is_snap_day"] = (
+                pd.to_numeric(merged.loc[mask, column], errors="coerce")
+                .fillna(0)
+                .astype(int)
+            )
+    return merged, selected
 
-    if long_sales.empty:
-        print("Price analysis skipped because no matching price data was found.")
-        return
 
-    long_sales["price_bin"] = pd.qcut(
-        long_sales["sell_price"].rank(method="first"),
-        q=4,
-        labels=["low", "mid_low", "mid_high", "high"],
-    )
+def _ordered(frame: pd.DataFrame, column: str = "sales_group") -> pd.DataFrame:
+    result = frame.copy()
+    result[column] = pd.Categorical(result[column], GROUP_ORDER, ordered=True)
+    return result.sort_values(column).reset_index(drop=True)
 
-    price_summary = (
-        long_sales.groupby(["sales_group", "price_bin"], observed=True)
+
+def create_summary(merged: pd.DataFrame, selected: pd.DataFrame) -> pd.DataFrame:
+    item_counts = selected.groupby("sales_group")["item_id"].nunique()
+    summary = (
+        merged.groupby("sales_group", observed=True)
         .agg(
-            平均販売数=("sales", "mean"),
-            平均価格=("sell_price", "mean"),
-            データ件数=("sales", "size"),
+            item_count=("item_id", "nunique"),
+            series_count=("id", "nunique"),
+            observation_count=("sales", "size"),
+            total_sales=("sales", "sum"),
+            mean_daily_sales=("sales", "mean"),
+            median_daily_sales=("sales", "median"),
+            sales_std=("sales", "std"),
+            zero_sales_rate=("is_zero_sale", "mean"),
+            mean_sell_price=("sell_price", "mean"),
+        )
+        .reset_index()
+    )
+    summary["item_count"] = summary["sales_group"].map(item_counts).fillna(
+        summary["item_count"]
+    )
+    summary["coefficient_of_variation"] = np.where(
+        summary["mean_daily_sales"].ne(0),
+        summary["sales_std"] / summary["mean_daily_sales"],
+        np.nan,
+    )
+    return _ordered(summary)
+
+
+def create_event_summary(merged: pd.DataFrame) -> pd.DataFrame:
+    result = (
+        merged.groupby(["sales_group", "has_event"], observed=True)
+        .agg(
+            observation_count=("sales", "size"),
+            mean_sales=("sales", "mean"),
+            total_sales=("sales", "sum"),
+            zero_sales_rate=("is_zero_sale", "mean"),
+        )
+        .reset_index()
+    )
+    result["event_status"] = np.where(result["has_event"], "event", "no_event")
+    return result.drop(columns="has_event")
+
+
+def create_snap_summary(merged: pd.DataFrame) -> pd.DataFrame:
+    result = (
+        merged.groupby(["sales_group", "is_snap_day"], observed=True)
+        .agg(
+            observation_count=("sales", "size"),
+            mean_sales=("sales", "mean"),
+            total_sales=("sales", "sum"),
+            zero_sales_rate=("is_zero_sale", "mean"),
+        )
+        .reset_index()
+    )
+    result["snap_status"] = np.where(result["is_snap_day"].eq(1), "snap", "no_snap")
+    return result.drop(columns="is_snap_day")
+
+
+def create_price_summary(merged: pd.DataFrame) -> pd.DataFrame:
+    priced = merged.dropna(subset=["sell_price"]).copy()
+    if priced.empty:
+        return pd.DataFrame(
+            columns=[
+                "sales_group",
+                "price_band",
+                "observation_count",
+                "mean_sell_price",
+                "mean_sales",
+                "total_sales",
+                "zero_sales_rate",
+            ]
+        )
+
+    def add_price_band(group: pd.DataFrame) -> pd.DataFrame:
+        result = group.copy()
+        unique_prices = result["sell_price"].nunique(dropna=True)
+        if unique_prices < 3:
+            result["price_band"] = "single_or_limited_price"
+            return result
+        codes = pd.qcut(
+            result["sell_price"], q=3, labels=False, duplicates="drop"
+        )
+        result["price_band"] = codes.map({0.0: "low", 1.0: "middle", 2.0: "high"}).fillna("single_or_limited_price")
+        return result
+
+    priced = (
+        priced.groupby("sales_group", group_keys=False, observed=True)
+        .apply(add_price_band)
+        .reset_index(drop=True)
+    )
+    return (
+        priced.groupby(["sales_group", "price_band"], observed=True)
+        .agg(
+            observation_count=("sales", "size"),
+            mean_sell_price=("sell_price", "mean"),
+            mean_sales=("sales", "mean"),
+            total_sales=("sales", "sum"),
+            zero_sales_rate=("is_zero_sale", "mean"),
         )
         .reset_index()
     )
 
-    price_summary["販売グループ"] = price_summary["sales_group"].map(GROUP_LABELS)
-    price_summary["価格帯"] = price_summary["price_bin"].astype(str).map(PRICE_BIN_LABELS)
 
-    output_df = price_summary[
-        ["販売グループ", "価格帯", "平均販売数", "平均価格", "データ件数"]
-    ]
+def _save_bar(
+    frame: pd.DataFrame,
+    x: str,
+    y: str,
+    title: str,
+    ylabel: str,
+    output_path: Path,
+) -> None:
+    pivot = frame.pivot(index=x, columns="sales_group", values=y)
+    pivot = pivot.reindex(columns=GROUP_ORDER)
+    ax = pivot.plot(kind="bar", figsize=(10, 6))
+    ax.set_title(title)
+    ax.set_xlabel("")
+    ax.set_ylabel(ylabel)
+    ax.tick_params(axis="x", rotation=0)
+    ax.figure.tight_layout()
+    ax.figure.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(ax.figure)
 
-    output_path = RESULTS_DIR / "business_price_vs_sales_summary.csv"
-    output_df.to_csv(output_path, index=False, encoding="utf-8-sig")
-    print(f"Saved: {output_path}")
 
-    pivot = output_df.pivot(
-        index="価格帯",
-        columns="販売グループ",
-        values="平均販売数",
+def create_images(
+    merged: pd.DataFrame,
+    summary: pd.DataFrame,
+    event_summary: pd.DataFrame,
+    snap_summary: pd.DataFrame,
+    price_summary: pd.DataFrame,
+) -> None:
+    monthly = (
+        merged.assign(month=merged["date"].dt.to_period("M").dt.to_timestamp())
+        .groupby(["month", "sales_group"], observed=True)["sales"]
+        .mean()
+        .reset_index()
     )
+    monthly_pivot = monthly.pivot(
+        index="month", columns="sales_group", values="sales"
+    ).reindex(columns=GROUP_ORDER)
+    ax = monthly_pivot.plot(figsize=(12, 6))
+    ax.set_title("Average daily sales trend by sales group")
+    ax.set_xlabel("Month")
+    ax.set_ylabel("Average daily sales")
+    ax.figure.tight_layout()
+    ax.figure.savefig(
+        IMAGES_DIR / "business_sales_trend_by_group.png",
+        dpi=150,
+        bbox_inches="tight",
+    )
+    plt.close(ax.figure)
 
-    price_order = ["低価格", "やや低価格", "やや高価格", "高価格"]
-    pivot = pivot.reindex(price_order)
+    zero = summary.set_index("sales_group").reindex(GROUP_ORDER)["zero_sales_rate"]
+    ax = zero.plot(kind="bar", figsize=(9, 6))
+    ax.set_title("Zero-sales rate by sales group")
+    ax.set_xlabel("")
+    ax.set_ylabel("Zero-sales rate")
+    ax.tick_params(axis="x", rotation=0)
+    ax.figure.tight_layout()
+    ax.figure.savefig(
+        IMAGES_DIR / "business_zero_rate_by_group.png", dpi=150, bbox_inches="tight"
+    )
+    plt.close(ax.figure)
 
-    plt.figure(figsize=(9, 5))
-    pivot.plot(kind="bar", ax=plt.gca())
-    plt.title("価格帯ごとの平均販売数")
-    plt.xlabel("価格帯")
-    plt.ylabel("平均販売数")
-    plt.xticks(rotation=0)
-    plt.tight_layout()
+    _save_bar(
+        event_summary,
+        "event_status",
+        "mean_sales",
+        "Event-day impact by sales group",
+        "Average daily sales",
+        IMAGES_DIR / "business_event_impact.png",
+    )
+    _save_bar(
+        snap_summary,
+        "snap_status",
+        "mean_sales",
+        "SNAP-day impact by sales group",
+        "Average daily sales",
+        IMAGES_DIR / "business_snap_impact.png",
+    )
+    if not price_summary.empty:
+        _save_bar(
+            price_summary,
+            "price_band",
+            "mean_sales",
+            "Sales by price band and sales group",
+            "Average daily sales",
+            IMAGES_DIR / "business_price_vs_sales.png",
+        )
 
-    output_path = IMAGES_DIR / "business_price_vs_sales.png"
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-    print(f"Saved: {output_path}")
+
+def save_csv(frame: pd.DataFrame, filename: str) -> None:
+    frame.to_csv(RESULTS_DIR / filename, index=False, encoding="utf-8-sig")
 
 
-def main():
-    setup_japanese_font()
+def main() -> None:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
+    print("Loading M5 data...")
     sales, calendar, prices = load_m5_data()
+    print("Selecting fixed item groups and preparing long-format data...")
+    merged, selected = prepare_long_data(sales, calendar, prices)
 
-    day_cols = [col for col in sales.columns if col.startswith("d_")]
+    summary = create_summary(merged, selected)
+    event_summary = create_event_summary(merged)
+    snap_summary = create_snap_summary(merged)
+    price_summary = create_price_summary(merged)
 
-    print("Filtering FOODS category...")
-    food_sales = sales[sales["cat_id"] == "FOODS"].copy()
+    save_csv(summary, "business_analysis_summary.csv")
+    save_csv(event_summary, "business_event_impact_summary.csv")
+    save_csv(snap_summary, "business_snap_impact_summary.csv")
+    save_csv(price_summary, "business_price_vs_sales_summary.csv")
+    create_images(merged, summary, event_summary, snap_summary, price_summary)
 
-    print(f"FOODS item-store rows: {len(food_sales):,}")
-    print(f"Number of day columns: {len(day_cols):,}")
-
-    print("Assigning sales groups...")
-    food_sales = assign_sales_group(food_sales, day_cols)
-
-    print("Creating group summary...")
-    summary = create_group_summary(food_sales, day_cols)
-
-    print("Creating sales trend chart...")
-    plot_sales_trend_by_group(food_sales, calendar, day_cols)
-
-    print("Creating zero rate chart...")
-    plot_zero_rate_by_group(summary)
-
-    print("Creating event / SNAP analysis...")
-    daily = create_state_group_daily_sales(food_sales, calendar, day_cols)
-    plot_event_snap_impact(daily)
-
-    print("Creating price analysis...")
-    analyze_price_vs_sales(food_sales, calendar, prices, day_cols)
-
-    print("Business analysis completed.")
+    print("Business analysis completed successfully.")
+    print(f"Selected item groups: {RESULTS_DIR / 'selected_item_groups.csv'}")
+    print(f"Results directory: {RESULTS_DIR}")
+    print(f"Images directory: {IMAGES_DIR}")
 
 
 if __name__ == "__main__":
