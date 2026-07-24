@@ -1,0 +1,12 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+xgboost-cpu
+kagglehub
+joblib
+jupyter
+nbconvert
+flask
+gunicorn
+boto3
